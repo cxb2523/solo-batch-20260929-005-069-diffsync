@@ -22,6 +22,39 @@ import pytest
 from diffsync import Adapter, DiffSyncModel
 from diffsync.diff import Diff, DiffElement
 from diffsync.exceptions import ObjectNotCreated, ObjectNotDeleted, ObjectNotUpdated
+from diffsync.store.fake_redis import FakeRedis
+
+
+@pytest.fixture(name="redisdb")
+def fixture_redisdb():
+    """In-memory fake Redis standing in for the pytest-redis server.
+
+    The upstream ``redisdb`` fixture spawns a real redis-server binary, which
+    is unavailable in some CI/local environments.
+    """
+    return FakeRedis()
+
+
+@pytest.fixture(autouse=True)
+def _fake_redis_from_url(monkeypatch, request):
+    """Route RedisStore URL/host construction onto the ``redisdb`` FakeRedis.
+
+    The negative-connectivity test (``url="redis://wrong"``) is left untouched
+    so it still exercises the connection-failure path.
+    """
+    if "redisdb" not in request.fixturenames:
+        return
+
+    fake = request.getfixturevalue("redisdb")
+
+    def from_url(_url, db=0):  # pylint: disable=unused-argument
+        return fake
+
+    def constructor(host=None, port=6379, db=0, **_kwargs):  # pylint: disable=unused-argument
+        return fake
+
+    monkeypatch.setattr("redis.Redis.from_url", staticmethod(from_url))
+    monkeypatch.setattr("redis.Redis", constructor)
 
 
 @pytest.fixture

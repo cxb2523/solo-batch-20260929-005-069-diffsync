@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Diff Store Trace - get/set 键序列与命中率</title>
+<style>
+  :root { --hit:#1a7f37; --cross:#9a6700; --miss:#cf222e; --written:#0969da;
+          --skipped:#8250df; --scan:#57606a; --repair:#bc4c00; }
+  * { box-sizing: border-box; }
+  body { font-family: "Segoe UI", "Microsoft YaHei", sans-serif; margin: 0;
+         background: #f6f8fa; color: #1f2328; }
+  header { background: #24292f; color: #fff; padding: 20px 28px; }
+  header h1 { margin: 0 0 6px; font-size: 22px; }
+  header p { margin: 2px 0; color: #c9d1d9; font-size: 13px; }
+  main { padding: 20px 28px; }
+  .tradeoffs { background: #fff; border: 1px solid #d0d7de; border-radius: 8px;
+                padding: 14px 18px; margin-bottom: 22px; }
+  .tradeoffs h2 { margin-top: 0; }
+  .tradeoff { margin: 8px 0; }
+  .tradeoff summary { font-weight: 600; cursor: pointer; }
+  .tradeoff p { margin: 6px 0 0; line-height: 1.6; color: #424a53; }
+  .columns { display: flex; gap: 20px; align-items: flex-start; }
+  .column { flex: 1; min-width: 0; }
+  h2 { border-bottom: 2px solid #d0d7de; padding-bottom: 6px; }
+  .overall { font-size: 14px; }
+  .scenario { background: #fff; border: 1px solid #d0d7de; border-radius: 8px;
+               padding: 12px 16px; margin-bottom: 18px; }
+  .scenario h3 { margin: 4px 0; font-size: 16px; }
+  .store { float: right; font-size: 12px; color: #57606a; font-weight: 400; }
+  .desc { color: #424a53; font-size: 13px; }
+  .stats, .note { font-size: 13px; margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; margin: 8px 0; }
+  th, td { border-bottom: 1px solid #eaeef2; padding: 4px 6px; text-align: left;
+           vertical-align: top; word-break: break-all; }
+  th { background: #f6f8fa; position: sticky; top: 0; }
+  .num { width: 34px; color: #57606a; }
+  .key { font-family: Consolas, monospace; }
+  .detail { color: #57606a; }
+  .res { font-weight: 700; white-space: nowrap; }
+  .hit { color: var(--hit); }
+  .cross { color: var(--cross); }
+  .miss { color: var(--miss); }
+  .written { color: var(--written); }
+  .skipped { color: var(--skipped); }
+  .scan { color: var(--scan); }
+  .repair { color: var(--repair); }
+  .op { font-family: Consolas, monospace; white-space: nowrap; }
+  details summary { cursor: pointer; font-size: 13px; font-weight: 600; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Store 可观测 Trace：三层 Diff/DiffElement 树 · get/set 键序列 · 命中率</h1>
+  <p>同一棵 site(level-0) → device(level-1) → interface(level-2) 树，dump 后分别走 LocalStore 与内存假 Redis (FakeRedis)。</p>
+  <p>覆盖：热重建、root 为空、父子同时未命中的并发回源、索引失效回源修复、pickle/JSON 双协议交叉读。</p>
+</header>
+<main>
+  <div class="tradeoffs">
+    <h2>三处取舍（互相咬住，注释与本页同源）</h2>
+    <details class='tradeoff'><summary>1. pickle 与 JSON 双协议共存：先试谁，读到对方的键怎么降级</summary><p>读取时先尝试 pickle（能无损还原 Diff/DiffElement 对象图）；若 blob 不是 pickle (UnpicklingError) 或不是合法 UTF-8/JSON，则降级用 json.loads 再解一次。被降级解出的键标记为 cross-protocol，只读不重写：键的字节归写下它的那个协议所有，本端不会把它偷偷改写成自己的协议。页面上这类命中单独计数，仍计入命中率。</p></details><details class='tradeoff'><summary>2. root 键命名 vs 父子键前缀扫描：临时遍历还是维护索引，失效后谁付代价</summary><p>键布局把 idx(集合) 和 root:&lt;tree&gt;(顺序) 放在 node: 前缀之外，子节点扫描 node:* 在命名上就不可能扫到 root/index，后端还会再过滤一层 :node:。常规重建 O(1) 读 root 拿前序、用 idx 集合校验；一旦 root/idx 丢失或与节点不一致，代价由读者承担：一次性 node:* 全量扫描并回建索引与 root，下一次读又回到 O(1)；写入方从不会为索引修复阻塞。root 键缺失且一个节点都没有时，判定为真空树 root-empty。</p></details><details class='tradeoff'><summary>3. 签名统一后，父子键同时未命中的并发回源：谁去重、重复写要不要覆盖</summary><p>BaseStore 统一 get_or_load_raw(key, loader) 签名，但去重落在各自真正掌控的层：LocalStore 同进程，持有 in-flight 注册表 + 锁，同键并发只回源一次，后到者共享结果；RedisStore 看不到别的进程，把保证下沉到服务端 SET NX——可能重复算，但只有首个写入生效，竞态失败者改为读出胜者的值。两家可观测契约一致：first writer wins，重复写入不覆盖(write-skipped)，迟到的父节点不可能盖掉先落地的更新子树。</p></details>
+  </div>
+  <div class="columns"><div class='column'><h2>LocalStore</h2><p class='overall'>聚合命中率：<b>77.1%</b> (27/35，其中跨协议命中 3)</p>
+    <section class="scenario">
+      <h3>warm-rebuild <span class="store">LocalStore/warm</span></h3>
+      <p class="desc">Dump then rebuild from a warm cache; root + index present, every node get is a hit.</p>
+      <p class="stats">gets=4 · hits=4 (cross=0) · misses=0 · sets=4 · written=4 · skipped=0 · <b>hit-rate=100.0%</b></p>
+      <p class="note">重建顺序来源：<b>root-index</b></p>
+      
+      <details open>
+        <summary>每次 get/set/scan 的键序列（9 条）</summary>
+        <table class="events">
+          <thead><tr><th>#</th><th>op</th><th>key</th><th>结果</th><th>协议</th><th>说明</th></tr></thead>
+          <tbody><tr><td class='num'>1</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>2</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>3</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>4</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:root:demo</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>5</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:root:demo</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr><tr><td class='num'>6</td><td class='op op-index'>index</td><td class='key'>diffsync:diff:idx</td><td class='res scan'>index-hit</td><td>-</td><td class='detail'>3 node key(s), root and index agree</td></tr><tr><td class='num'>7</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr><tr><td class='num'>8</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr><tr><td class='num'>9</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr></tbody>
+        </table>
+      </details>
+      <details open>
+        <summary>整棵树的重建顺序（节点）</summary>
+        <table class="order">
+          <thead><tr><th>#</th><th>层级</th><th>node key</th><th>命中/回源</th></tr></thead>
+          <tbody><tr><td class='num'>1</td><td>level-0</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res hit'>hit</td></tr><tr><td class='num'>2</td><td>level-1</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res hit'>hit</td></tr><tr><td class='num'>3</td><td>level-2</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res hit'>hit</td></tr></tbody>
+        </table>
+      </details>
+      <p class="note">Key sequence = set nodes -&gt; set root; rebuild = get root -&gt; index -&gt; node gets (preorder).</p>
+    </section>
+    
+    <section class="scenario">
+      <h3>root-empty <span class="store">LocalStore/empty</span></h3>
+      <p class="desc">Empty tree writes no root key; rebuild finds root absent and zero node keys, so no phantom tree is invented.</p>
+      <p class="stats">gets=1 · hits=0 (cross=0) · misses=1 · sets=0 · written=0 · skipped=0 · <b>hit-rate=0.0%</b></p>
+      <p class="note">重建顺序来源：<b>root-empty</b></p>
+      
+      <details open>
+        <summary>每次 get/set/scan 的键序列（3 条）</summary>
+        <table class="events">
+          <thead><tr><th>#</th><th>op</th><th>key</th><th>结果</th><th>协议</th><th>说明</th></tr></thead>
+          <tbody><tr><td class='num'>1</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:root:empty</td><td class='res miss'>miss</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>2</td><td class='op op-scan'>scan</td><td class='key'>diffsync:diff:node:*</td><td class='res scan'>scan</td><td>-</td><td class='detail'>0 node key(s)</td></tr><tr><td class='num'>3</td><td class='op op-index'>index</td><td class='key'>diffsync:diff:root:empty</td><td class='res scan'>index-hit</td><td>-</td><td class='detail'>root empty: no root key and no node keys</td></tr></tbody>
+        </table>
+      </details>
+      <details open>
+        <summary>整棵树的重建顺序（节点）</summary>
+        <table class="order">
+          <thead><tr><th>#</th><th>层级</th><th>node key</th><th>命中/回源</th></tr></thead>
+          <tbody><tr><td colspan=4>（空树，无节点）</td></tr></tbody>
+        </table>
+      </details>
+      <p class="note">Cost paid: one root GET + one empty node-prefix existence scan; no index repair needed.</p>
+    </section>
+    
+    <section class="scenario">
+      <h3>index-repair <span class="store">LocalStore/repair</span></h3>
+      <p class="desc">Nodes survive but root and index are lost; the reader does a one-off :node:* scan, rebuilds index+root, and the next rebuild is O(1) again.</p>
+      <p class="stats">gets=8 · hits=7 (cross=0) · misses=1 · sets=5 · written=5 · skipped=0 · <b>hit-rate=87.5%</b></p>
+      <p class="note">重建顺序来源：<b>repaired-scan</b></p>
+      
+      <details open>
+        <summary>每次 get/set/scan 的键序列（16 条）</summary>
+        <table class="events">
+          <thead><tr><th>#</th><th>op</th><th>key</th><th>结果</th><th>协议</th><th>说明</th></tr></thead>
+          <tbody><tr><td class='num'>1</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>2</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>3</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>4</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:root:repair</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>5</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:root:repair</td><td class='res miss'>miss</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>6</td><td class='op op-scan'>scan</td><td class='key'>diffsync:diff:node:*</td><td class='res scan'>scan</td><td>-</td><td class='detail'>3 node key(s)</td></tr><tr><td class='num'>7</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:root:repair</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>8</td><td class='op op-index'>index</td><td class='key'>diffsync:diff:idx</td><td class='res repair'>index-repaired</td><td>-</td><td class='detail'>reader paid fallback node scan and rebuilt index/root</td></tr><tr><td class='num'>9</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr><tr><td class='num'>10</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr><tr><td class='num'>11</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr><tr><td class='num'>12</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:root:repair</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr><tr><td class='num'>13</td><td class='op op-index'>index</td><td class='key'>diffsync:diff:idx</td><td class='res scan'>index-hit</td><td>-</td><td class='detail'>3 node key(s), root and index agree</td></tr><tr><td class='num'>14</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr><tr><td class='num'>15</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr><tr><td class='num'>16</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr></tbody>
+        </table>
+      </details>
+      <details open>
+        <summary>整棵树的重建顺序（节点）</summary>
+        <table class="order">
+          <thead><tr><th>#</th><th>层级</th><th>node key</th><th>命中/回源</th></tr></thead>
+          <tbody><tr><td class='num'>1</td><td>level-0</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res hit'>hit</td></tr><tr><td class='num'>2</td><td>level-1</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res hit'>hit</td></tr><tr><td class='num'>3</td><td>level-2</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res hit'>hit</td></tr></tbody>
+        </table>
+      </details>
+      <p class="note">First rebuild order source: repaired-scan; second rebuild order source: root-index (repaired).</p>
+    </section>
+    
+    <section class="scenario">
+      <h3>concurrent-parent-child-miss <span class="store">LocalStore/cold</span></h3>
+      <p class="desc">Cold cache, two rebuild threads start simultaneously so a parent and its children miss together.</p>
+      <p class="stats">gets=14 · hits=8 (cross=0) · misses=6 · sets=7 · written=7 · skipped=0 · <b>hit-rate=57.1%</b></p>
+      <p class="note">重建顺序来源：<b>root-index</b></p>
+      <p class='note'>loader 回源调用次数：<b>3</b> (节点数 3；调用序列: d0-p00-site__nyc -&gt; d1-p01-device__spine1 -&gt; d2-p02-interface__eth0)</p>
+      <details open>
+        <summary>每次 get/set/scan 的键序列（23 条）</summary>
+        <table class="events">
+          <thead><tr><th>#</th><th>op</th><th>key</th><th>结果</th><th>协议</th><th>说明</th></tr></thead>
+          <tbody><tr><td class='num'>1</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>2</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>3</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>4</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:root:cold</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>5</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr><tr><td class='num'>6</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr><tr><td class='num'>7</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr><tr><td class='num'>8</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:root:cold</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr><tr><td class='num'>9</td><td class='op op-index'>index</td><td class='key'>diffsync:diff:idx</td><td class='res scan'>index-hit</td><td>-</td><td class='detail'>3 node key(s), root and index agree</td></tr><tr><td class='num'>10</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res miss'>miss</td><td>-</td><td class='detail'>back-to-source</td></tr><tr><td class='num'>11</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:root:cold</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr><tr><td class='num'>12</td><td class='op op-index'>index</td><td class='key'>diffsync:diff:idx</td><td class='res scan'>index-hit</td><td>-</td><td class='detail'>3 node key(s), root and index agree</td></tr><tr><td class='num'>13</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res miss'>miss</td><td>-</td><td class='detail'>waiting on in-flight loader</td></tr><tr><td class='num'>14</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res written'>written</td><td>-</td><td class='detail'>dedup owner write</td></tr><tr><td class='num'>15</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res miss'>miss</td><td>-</td><td class='detail'>back-to-source</td></tr><tr><td class='num'>16</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res hit'>hit</td><td>raw</td><td class='detail'>shared loader result</td></tr><tr><td class='num'>17</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res miss'>miss</td><td>-</td><td class='detail'>waiting on in-flight loader</td></tr><tr><td class='num'>18</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res written'>written</td><td>-</td><td class='detail'>dedup owner write</td></tr><tr><td class='num'>19</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res miss'>miss</td><td>-</td><td class='detail'>back-to-source</td></tr><tr><td class='num'>20</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res hit'>hit</td><td>raw</td><td class='detail'>shared loader result</td></tr><tr><td class='num'>21</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res miss'>miss</td><td>-</td><td class='detail'>waiting on in-flight loader</td></tr><tr><td class='num'>22</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res written'>written</td><td>-</td><td class='detail'>dedup owner write</td></tr><tr><td class='num'>23</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res hit'>hit</td><td>raw</td><td class='detail'>shared loader result</td></tr></tbody>
+        </table>
+      </details>
+      <details open>
+        <summary>整棵树的重建顺序（节点）</summary>
+        <table class="order">
+          <thead><tr><th>#</th><th>层级</th><th>node key</th><th>命中/回源</th></tr></thead>
+          <tbody><tr><td class='num'>1</td><td>level-0</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res miss'>miss</td></tr><tr><td class='num'>2</td><td>level-1</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res miss'>miss</td></tr><tr><td class='num'>3</td><td>level-2</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res miss'>miss</td></tr></tbody>
+        </table>
+      </details>
+      <p class="note">LocalStore dedups same-key misses in-process: 3 loader call(s) for 3 missing node key(s); the second thread shares the in-flight result.</p>
+    </section>
+    
+    <section class="scenario">
+      <h3>cross-protocol-read <span class="store">LocalStore-reader</span></h3>
+      <p class="desc">Pickle writer, JSON reader: deserialization tries pickle first, falls back to JSON; foreign keys decode but are never overwritten.</p>
+      <p class="stats">gets=8 · hits=8 (cross=3) · misses=0 · sets=6 · written=5 · skipped=1 · <b>hit-rate=100.0%</b></p>
+      <p class="note">重建顺序来源：<b>repaired-scan</b></p>
+      
+      <details open>
+        <summary>每次 get/set/scan 的键序列（16 条）</summary>
+        <table class="events">
+          <thead><tr><th>#</th><th>op</th><th>key</th><th>结果</th><th>协议</th><th>说明</th></tr></thead>
+          <tbody><tr><td class='num'>1</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>2</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>3</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>4</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:root:cross</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>5</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:root:cross</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr><tr><td class='num'>6</td><td class='op op-scan'>scan</td><td class='key'>diffsync:diff:node:*</td><td class='res scan'>scan</td><td>-</td><td class='detail'>3 node key(s)</td></tr><tr><td class='num'>7</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:root:cross</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>8</td><td class='op op-index'>index</td><td class='key'>diffsync:diff:idx</td><td class='res repair'>index-repaired</td><td>-</td><td class='detail'>reader paid fallback node scan and rebuilt index/root</td></tr><tr><td class='num'>9</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr><tr><td class='num'>10</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res cross'>cross-protocol</td><td>pickle</td><td class='detail'>foreign-protocol key decoded via fallback, left untouched</td></tr><tr><td class='num'>11</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr><tr><td class='num'>12</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res cross'>cross-protocol</td><td>pickle</td><td class='detail'>foreign-protocol key decoded via fallback, left untouched</td></tr><tr><td class='num'>13</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr><tr><td class='num'>14</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res cross'>cross-protocol</td><td>pickle</td><td class='detail'>foreign-protocol key decoded via fallback, left untouched</td></tr><tr><td class='num'>15</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res skipped'>write-skipped</td><td>-</td><td class='detail'>key already present; first writer wins, no overwrite</td></tr><tr><td class='num'>16</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr></tbody>
+        </table>
+      </details>
+      <details open>
+        <summary>整棵树的重建顺序（节点）</summary>
+        <table class="order">
+          <thead><tr><th>#</th><th>层级</th><th>node key</th><th>命中/回源</th></tr></thead>
+          <tbody><tr><td class='num'>1</td><td>level-0</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res cross'>cross-protocol</td></tr><tr><td class='num'>2</td><td>level-1</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res cross'>cross-protocol</td></tr><tr><td class='num'>3</td><td>level-2</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res cross'>cross-protocol</td></tr></tbody>
+        </table>
+      </details>
+      <p class="note">All 3 nodes decoded as cross-protocol; a JSON re-write was write-skipped (False) so the pickle bytes survived.</p>
+    </section>
+    </div><div class='column'><h2>RedisStore</h2><p class='overall'>聚合命中率：<b>77.1%</b> (27/35，其中跨协议命中 3)</p>
+    <section class="scenario">
+      <h3>warm-rebuild <span class="store">RedisStore/warm (831ff5d9-5ba2-4bfa-b48b-2e3c515d4259)</span></h3>
+      <p class="desc">Dump then rebuild from a warm cache; root + index present, every node get is a hit.</p>
+      <p class="stats">gets=4 · hits=4 (cross=0) · misses=0 · sets=4 · written=4 · skipped=0 · <b>hit-rate=100.0%</b></p>
+      <p class="note">重建顺序来源：<b>root-index</b></p>
+      
+      <details open>
+        <summary>每次 get/set/scan 的键序列（9 条）</summary>
+        <table class="events">
+          <thead><tr><th>#</th><th>op</th><th>key</th><th>结果</th><th>协议</th><th>说明</th></tr></thead>
+          <tbody><tr><td class='num'>1</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>2</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>3</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>4</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:root:demo</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>5</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:root:demo</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr><tr><td class='num'>6</td><td class='op op-index'>index</td><td class='key'>diffsync:diff:idx</td><td class='res scan'>index-hit</td><td>-</td><td class='detail'>3 node key(s), root and index agree</td></tr><tr><td class='num'>7</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr><tr><td class='num'>8</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr><tr><td class='num'>9</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr></tbody>
+        </table>
+      </details>
+      <details open>
+        <summary>整棵树的重建顺序（节点）</summary>
+        <table class="order">
+          <thead><tr><th>#</th><th>层级</th><th>node key</th><th>命中/回源</th></tr></thead>
+          <tbody><tr><td class='num'>1</td><td>level-0</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res hit'>hit</td></tr><tr><td class='num'>2</td><td>level-1</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res hit'>hit</td></tr><tr><td class='num'>3</td><td>level-2</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res hit'>hit</td></tr></tbody>
+        </table>
+      </details>
+      <p class="note">Key sequence = set nodes -&gt; set root; rebuild = get root -&gt; index -&gt; node gets (preorder).</p>
+    </section>
+    
+    <section class="scenario">
+      <h3>root-empty <span class="store">RedisStore/empty (4a29a9f8-0bcb-4ba5-8e8a-161c7e72c94c)</span></h3>
+      <p class="desc">Empty tree writes no root key; rebuild finds root absent and zero node keys, so no phantom tree is invented.</p>
+      <p class="stats">gets=1 · hits=0 (cross=0) · misses=1 · sets=0 · written=0 · skipped=0 · <b>hit-rate=0.0%</b></p>
+      <p class="note">重建顺序来源：<b>root-empty</b></p>
+      
+      <details open>
+        <summary>每次 get/set/scan 的键序列（3 条）</summary>
+        <table class="events">
+          <thead><tr><th>#</th><th>op</th><th>key</th><th>结果</th><th>协议</th><th>说明</th></tr></thead>
+          <tbody><tr><td class='num'>1</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:root:empty</td><td class='res miss'>miss</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>2</td><td class='op op-scan'>scan</td><td class='key'>diffsync:diff:node:*</td><td class='res scan'>scan</td><td>-</td><td class='detail'>0 node key(s)</td></tr><tr><td class='num'>3</td><td class='op op-index'>index</td><td class='key'>diffsync:diff:root:empty</td><td class='res scan'>index-hit</td><td>-</td><td class='detail'>root empty: no root key and no node keys</td></tr></tbody>
+        </table>
+      </details>
+      <details open>
+        <summary>整棵树的重建顺序（节点）</summary>
+        <table class="order">
+          <thead><tr><th>#</th><th>层级</th><th>node key</th><th>命中/回源</th></tr></thead>
+          <tbody><tr><td colspan=4>（空树，无节点）</td></tr></tbody>
+        </table>
+      </details>
+      <p class="note">Cost paid: one root GET + one empty node-prefix existence scan; no index repair needed.</p>
+    </section>
+    
+    <section class="scenario">
+      <h3>index-repair <span class="store">RedisStore/repair (2096427c-1dbb-42e5-bad6-39f2d0fdaede)</span></h3>
+      <p class="desc">Nodes survive but root and index are lost; the reader does a one-off :node:* scan, rebuilds index+root, and the next rebuild is O(1) again.</p>
+      <p class="stats">gets=8 · hits=7 (cross=0) · misses=1 · sets=5 · written=5 · skipped=0 · <b>hit-rate=87.5%</b></p>
+      <p class="note">重建顺序来源：<b>repaired-scan</b></p>
+      
+      <details open>
+        <summary>每次 get/set/scan 的键序列（16 条）</summary>
+        <table class="events">
+          <thead><tr><th>#</th><th>op</th><th>key</th><th>结果</th><th>协议</th><th>说明</th></tr></thead>
+          <tbody><tr><td class='num'>1</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>2</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>3</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>4</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:root:repair</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>5</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:root:repair</td><td class='res miss'>miss</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>6</td><td class='op op-scan'>scan</td><td class='key'>diffsync:diff:node:*</td><td class='res scan'>scan</td><td>-</td><td class='detail'>3 node key(s)</td></tr><tr><td class='num'>7</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:root:repair</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>8</td><td class='op op-index'>index</td><td class='key'>diffsync:diff:idx</td><td class='res repair'>index-repaired</td><td>-</td><td class='detail'>reader paid fallback node scan and rebuilt index/root</td></tr><tr><td class='num'>9</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr><tr><td class='num'>10</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr><tr><td class='num'>11</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr><tr><td class='num'>12</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:root:repair</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr><tr><td class='num'>13</td><td class='op op-index'>index</td><td class='key'>diffsync:diff:idx</td><td class='res scan'>index-hit</td><td>-</td><td class='detail'>3 node key(s), root and index agree</td></tr><tr><td class='num'>14</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr><tr><td class='num'>15</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr><tr><td class='num'>16</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr></tbody>
+        </table>
+      </details>
+      <details open>
+        <summary>整棵树的重建顺序（节点）</summary>
+        <table class="order">
+          <thead><tr><th>#</th><th>层级</th><th>node key</th><th>命中/回源</th></tr></thead>
+          <tbody><tr><td class='num'>1</td><td>level-0</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res hit'>hit</td></tr><tr><td class='num'>2</td><td>level-1</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res hit'>hit</td></tr><tr><td class='num'>3</td><td>level-2</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res hit'>hit</td></tr></tbody>
+        </table>
+      </details>
+      <p class="note">First rebuild order source: repaired-scan; second rebuild order source: root-index (repaired).</p>
+    </section>
+    
+    <section class="scenario">
+      <h3>concurrent-parent-child-miss <span class="store">RedisStore/cold (33387252-ddbd-4811-b490-9afe41173269)</span></h3>
+      <p class="desc">Cold cache, two rebuild threads start simultaneously so a parent and its children miss together.</p>
+      <p class="stats">gets=14 · hits=8 (cross=0) · misses=6 · sets=10 · written=7 · skipped=3 · <b>hit-rate=57.1%</b></p>
+      <p class="note">重建顺序来源：<b>root-index</b></p>
+      <p class='note'>loader 回源调用次数：<b>6</b> (节点数 3；调用序列: d0-p00-site__nyc -&gt; d0-p00-site__nyc -&gt; d1-p01-device__spine1 -&gt; d1-p01-device__spine1 -&gt; d2-p02-interface__eth0 -&gt; d2-p02-interface__eth0)</p>
+      <details open>
+        <summary>每次 get/set/scan 的键序列（26 条）</summary>
+        <table class="events">
+          <thead><tr><th>#</th><th>op</th><th>key</th><th>结果</th><th>协议</th><th>说明</th></tr></thead>
+          <tbody><tr><td class='num'>1</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>2</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>3</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>4</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:root:cold</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>5</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr><tr><td class='num'>6</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr><tr><td class='num'>7</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr><tr><td class='num'>8</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:root:cold</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr><tr><td class='num'>9</td><td class='op op-index'>index</td><td class='key'>diffsync:diff:idx</td><td class='res scan'>index-hit</td><td>-</td><td class='detail'>3 node key(s), root and index agree</td></tr><tr><td class='num'>10</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res miss'>miss</td><td>-</td><td class='detail'>back-to-source</td></tr><tr><td class='num'>11</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:root:cold</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr><tr><td class='num'>12</td><td class='op op-index'>index</td><td class='key'>diffsync:diff:idx</td><td class='res scan'>index-hit</td><td>-</td><td class='detail'>3 node key(s), root and index agree</td></tr><tr><td class='num'>13</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res miss'>miss</td><td>-</td><td class='detail'>back-to-source</td></tr><tr><td class='num'>14</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>15</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res miss'>miss</td><td>-</td><td class='detail'>back-to-source</td></tr><tr><td class='num'>16</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res skipped'>write-skipped</td><td>-</td><td class='detail'>SET NX lost; first writer wins, no overwrite</td></tr><tr><td class='num'>17</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res hit'>hit</td><td>raw</td><td class='detail'>read NX winner</td></tr><tr><td class='num'>18</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res miss'>miss</td><td>-</td><td class='detail'>back-to-source</td></tr><tr><td class='num'>19</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>20</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res miss'>miss</td><td>-</td><td class='detail'>back-to-source</td></tr><tr><td class='num'>21</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res skipped'>write-skipped</td><td>-</td><td class='detail'>SET NX lost; first writer wins, no overwrite</td></tr><tr><td class='num'>22</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res hit'>hit</td><td>raw</td><td class='detail'>read NX winner</td></tr><tr><td class='num'>23</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res miss'>miss</td><td>-</td><td class='detail'>back-to-source</td></tr><tr><td class='num'>24</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>25</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res skipped'>write-skipped</td><td>-</td><td class='detail'>SET NX lost; first writer wins, no overwrite</td></tr><tr><td class='num'>26</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res hit'>hit</td><td>raw</td><td class='detail'>read NX winner</td></tr></tbody>
+        </table>
+      </details>
+      <details open>
+        <summary>整棵树的重建顺序（节点）</summary>
+        <table class="order">
+          <thead><tr><th>#</th><th>层级</th><th>node key</th><th>命中/回源</th></tr></thead>
+          <tbody><tr><td class='num'>1</td><td>level-0</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res miss'>miss</td></tr><tr><td class='num'>2</td><td>level-1</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res miss'>miss</td></tr><tr><td class='num'>3</td><td>level-2</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res miss'>miss</td></tr></tbody>
+        </table>
+      </details>
+      <p class="note">RedisStore cannot share an in-process event: 6 loader call(s) for 3 missing key(s); SET NX keeps 3 first writes and skips the duplicate writes, never overwriting.</p>
+    </section>
+    
+    <section class="scenario">
+      <h3>cross-protocol-read <span class="store">RedisStore-reader (9a52b72f-6b52-430e-b29e-f8d6ee3cb46b)</span></h3>
+      <p class="desc">Pickle writer, JSON reader: deserialization tries pickle first, falls back to JSON; foreign keys decode but are never overwritten.</p>
+      <p class="stats">gets=8 · hits=8 (cross=3) · misses=0 · sets=6 · written=5 · skipped=1 · <b>hit-rate=100.0%</b></p>
+      <p class="note">重建顺序来源：<b>repaired-scan</b></p>
+      
+      <details open>
+        <summary>每次 get/set/scan 的键序列（16 条）</summary>
+        <table class="events">
+          <thead><tr><th>#</th><th>op</th><th>key</th><th>结果</th><th>协议</th><th>说明</th></tr></thead>
+          <tbody><tr><td class='num'>1</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>2</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>3</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>4</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:root:cross</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>5</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:root:cross</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr><tr><td class='num'>6</td><td class='op op-scan'>scan</td><td class='key'>diffsync:diff:node:*</td><td class='res scan'>scan</td><td>-</td><td class='detail'>3 node key(s)</td></tr><tr><td class='num'>7</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:root:cross</td><td class='res written'>written</td><td>-</td><td class='detail'></td></tr><tr><td class='num'>8</td><td class='op op-index'>index</td><td class='key'>diffsync:diff:idx</td><td class='res repair'>index-repaired</td><td>-</td><td class='detail'>reader paid fallback node scan and rebuilt index/root</td></tr><tr><td class='num'>9</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr><tr><td class='num'>10</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res cross'>cross-protocol</td><td>pickle</td><td class='detail'>foreign-protocol key decoded via fallback, left untouched</td></tr><tr><td class='num'>11</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr><tr><td class='num'>12</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res cross'>cross-protocol</td><td>pickle</td><td class='detail'>foreign-protocol key decoded via fallback, left untouched</td></tr><tr><td class='num'>13</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr><tr><td class='num'>14</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res cross'>cross-protocol</td><td>pickle</td><td class='detail'>foreign-protocol key decoded via fallback, left untouched</td></tr><tr><td class='num'>15</td><td class='op op-set'>set</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res skipped'>write-skipped</td><td>-</td><td class='detail'>SET NX lost; first writer wins, no overwrite</td></tr><tr><td class='num'>16</td><td class='op op-get'>get</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res hit'>hit</td><td>raw</td><td class='detail'></td></tr></tbody>
+        </table>
+      </details>
+      <details open>
+        <summary>整棵树的重建顺序（节点）</summary>
+        <table class="order">
+          <thead><tr><th>#</th><th>层级</th><th>node key</th><th>命中/回源</th></tr></thead>
+          <tbody><tr><td class='num'>1</td><td>level-0</td><td class='key'>diffsync:diff:node:d0-p00-site__nyc</td><td class='res cross'>cross-protocol</td></tr><tr><td class='num'>2</td><td>level-1</td><td class='key'>diffsync:diff:node:d1-p01-device__spine1</td><td class='res cross'>cross-protocol</td></tr><tr><td class='num'>3</td><td>level-2</td><td class='key'>diffsync:diff:node:d2-p02-interface__eth0</td><td class='res cross'>cross-protocol</td></tr></tbody>
+        </table>
+      </details>
+      <p class="note">All 3 nodes decoded as cross-protocol; a JSON re-write was write-skipped (False) so the pickle bytes survived.</p>
+    </section>
+    </div></div>
+</main>
+</body>
+</html>

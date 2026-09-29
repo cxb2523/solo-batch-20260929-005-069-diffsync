@@ -3,7 +3,7 @@
 import copy
 import uuid
 from pickle import dumps, loads  # nosec
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Type, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Type, Union
 
 try:
     from redis import Redis
@@ -22,7 +22,24 @@ REDIS_DIFFSYNC_ROOT_LABEL = "diffsync"
 
 
 class RedisStore(BaseStore):
-    """RedisStore class."""
+    """RedisStore class.
+
+    Raw key/value operations on this backend implement the Redis side of the
+    three tradeoffs in :mod:`diffsync.store.tracing`:
+
+    1. Values are stored as opaque bytes; deserialization in the caller tries
+       pickle first and degrades to JSON when the key was written by a
+       JSON-only peer.
+    2. Key layout keeps ``:idx`` / ``:root:`` outside the ``:node:`` prefix,
+       so ``SCAN MATCH ...:node:*`` only ever enumerates children. When the
+       index is missing/stale the *reader* performs the one-off fallback scan
+       and repairs the index; writes are not blocked waiting for the index.
+    3. This backend cannot see another process' in-flight registry, so
+       parent+child concurrent misses are deduped on the server with
+       ``SET key value NX``: redundant source fetches may still happen, but
+       only the first writer's value survives - duplicate writes are skipped
+       and never overwrite, matching LocalStore's observable contract.
+    """
 
     def __init__(  # pylint: disable=too-many-arguments
         self,
@@ -32,6 +49,7 @@ class RedisStore(BaseStore):
         port: int = 6379,
         url: Optional[str] = None,
         db: int = 0,
+        client: Any = None,
         **kwargs: Any,
     ):
         """Init method for RedisStore."""
@@ -41,7 +59,11 @@ class RedisStore(BaseStore):
             raise ValueError("'url' and 'host' arguments can't be specified together.")
 
         try:
-            if url:
+            if client is not None:
+                # Injected client (real Redis connection or the in-memory
+                # FakeRedis used by tests/tracing); bypass host/url discovery.
+                self._store = client
+            elif url:
                 self._store = Redis.from_url(url, db=db)
             elif host:
                 self._store = Redis(host=host, port=port, db=db)
@@ -218,3 +240,79 @@ class RedisStore(BaseStore):
             search_pattern = f"{self._store_label}:{modelname.lower()}:*"
 
         return len(list(self._store.scan_iter(search_pattern)))
+
+    # ------------------------------------------------------------------
+    # Unified raw key/value API (see BaseStore) - RedisStore implementation.
+    # ------------------------------------------------------------------
+
+    def get_raw(self, key: str) -> Optional[bytes]:
+        """Return the raw blob at ``key`` or ``None`` and trace the outcome."""
+        value = self._store.get(key)
+        if value is None:
+            self._trace(op="get", key=key, result="miss")
+            return None
+        self._trace(op="get", key=key, result="hit", protocol="raw")
+        return value
+
+    def set_raw(self, key: str, value: bytes, *, nx: bool = False) -> bool:
+        """Write with optional ``NX`` semantics (first-writer-wins, no overwrite)."""
+        written = self._store.set(key, value, nx=nx)
+        if written:
+            self._trace(op="set", key=key, result="written")
+            return True
+        self._trace(
+            op="set",
+            key=key,
+            result="write-skipped",
+            detail="SET NX lost; first writer wins, no overwrite",
+        )
+        return False
+
+    def get_or_load_raw(self, key: str, loader: Callable[[], bytes]) -> Tuple[bytes, bool]:
+        """Get ``key`` or back-to-source ``loader`` and claim the write with NX.
+
+        Tradeoff #3, RedisStore side: cross-process same-key misses cannot share
+        an in-process event, so each concurrent miss may run its own
+        ``loader`` (duplicated source work is accepted as the price of no
+        shared memory); the duplicate *write* is what is deduped - and only
+        on the server, via ``SET NX``. A lost race re-reads the winner's value
+        so every caller observes the same first-written blob.
+        """
+        value = self._store.get(key)
+        if value is not None:
+            self._trace(op="get", key=key, result="hit", protocol="raw")
+            return value, False
+
+        self._trace(op="get", key=key, result="miss", detail="back-to-source")
+        loaded_value = loader()
+        if self.set_raw(key, loaded_value, nx=True):
+            return loaded_value, True
+        # Lost the SET NX race to a concurrent first writer: return its blob.
+        winner = self._store.get(key)
+        self._trace(op="get", key=key, result="hit", protocol="raw", detail="read NX winner")
+        return winner, True
+
+    def scan_keys_raw(self, pattern: str) -> List[str]:
+        """Fallback O(N) ``SCAN`` traversal used only when the index is stale."""
+        matches = []
+        for item in self._store.scan_iter(pattern):
+            if isinstance(item, bytes):
+                item = item.decode()
+            # Defensive strip of non-node keys, mirroring LocalStore: root and
+            # index keys must never be mistaken for tree children.
+            if ":node:" in item:
+                matches.append(item)
+        self._trace(op="scan", key=pattern, result="scan", detail=f"{len(matches)} node key(s)")
+        return matches
+
+    def add_index_raw(self, index_key: str, member: str) -> None:
+        """Add a node key to the Redis SET backing the tree index."""
+        self._store.sadd(index_key, member)
+
+    def index_members_raw(self, index_key: str) -> Optional[List[str]]:
+        """Return the indexed node keys, or ``None`` if the index SET is absent/empty."""
+        if not self._store.exists(index_key):
+            return None
+        members = self._store.smembers(index_key)
+        decoded = {member.decode() if isinstance(member, bytes) else member for member in members}
+        return sorted(decoded)
