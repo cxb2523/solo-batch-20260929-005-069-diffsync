@@ -1,9 +1,10 @@
 """RedisStore module."""
 
 import copy
+import time
 import uuid
 from pickle import dumps, loads  # nosec
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Type, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Type, Union
 
 try:
     from redis import Redis
@@ -13,12 +14,13 @@ except ImportError as ierr:
     raise ierr
 
 from diffsync.exceptions import ObjectAlreadyExists, ObjectNotFound, ObjectStoreException
-from diffsync.store import BaseStore
+from diffsync.store import BaseStore, DiffProtocol, decode_diff_payload
 
 if TYPE_CHECKING:
     from diffsync import DiffSyncModel
 
 REDIS_DIFFSYNC_ROOT_LABEL = "diffsync"
+REDIS_DIFF_TREE_ROOT_LABEL = "diffsync-diff-tree"
 
 
 class RedisStore(BaseStore):
@@ -32,16 +34,18 @@ class RedisStore(BaseStore):
         port: int = 6379,
         url: Optional[str] = None,
         db: int = 0,
+        client: Optional[Any] = None,
         **kwargs: Any,
     ):
         """Init method for RedisStore."""
         super().__init__(*args, **kwargs)
 
-        if url and host and port:
-            raise ValueError("'url' and 'host' arguments can't be specified together.")
-
         try:
-            if url:
+            if client is not None:
+                self._store = client
+            elif url and host:
+                raise ValueError("'url' and 'host' arguments can't be specified together.")
+            elif url:
                 self._store = Redis.from_url(url, db=db)
             elif host:
                 self._store = Redis(host=host, port=port, db=db)
@@ -61,14 +65,120 @@ class RedisStore(BaseStore):
         """Render store name."""
         return f"{self.name} ({self._store_id})"
 
+    def _diff_tree_prefix(self, tree: str) -> str:
+        """Get the Redis-scoped prefix for a diff tree."""
+        from urllib.parse import quote
+
+        return f"{REDIS_DIFF_TREE_ROOT_LABEL}:{self._store_id}:{quote(tree, safe='')}"
+
     def _get_object_from_redis_key(self, key: str) -> "DiffSyncModel":
         """Get the object from Redis key."""
         pickled_object = self._store.get(key)
         if pickled_object:
+            if not isinstance(pickled_object, (bytes, bytearray)):
+                raise ObjectStoreException(f"Model key {key} contains a non-pickle value")
             obj_result = loads(pickled_object)  # noqa: S301
             obj_result.adapter = self.adapter
+            self._trace(operation="get", scope="model", key=key, result="hit", protocol="pickle")
             return obj_result
+        self._trace(operation="get", scope="model", key=key, result="miss")
         raise ObjectNotFound(f"{key} not present in Cache")
+
+    def _backend_raw_get(self, key: str) -> Optional[Union[str, bytes]]:
+        """Read one raw Redis value."""
+        return self._store.get(key)
+
+    def _backend_raw_set(self, key: str, value: Union[str, bytes], *, nx: bool = False) -> bool:
+        """Write one raw Redis value without overwrite when nx is requested."""
+        if isinstance(value, str):
+            redis_value: Union[str, bytes] = value.encode("utf-8")
+        else:
+            redis_value = value
+        if nx:
+            return bool(self._store.set(key, redis_value, nx=True))
+        self._store.set(key, redis_value)
+        return True
+
+    def _backend_raw_delete(self, key: str) -> None:
+        """Delete one raw Redis key."""
+        self._store.delete(key)
+
+    def _backend_raw_scan_prefix(self, prefix: str) -> List[str]:
+        """List Redis keys below a glob prefix."""
+        return [key.decode("utf-8") if isinstance(key, bytes) else key for key in self._store.scan_iter(prefix)]
+
+    def _get_or_set_raw(
+        self,
+        key: str,
+        factory: Callable[[], Any],
+        *,
+        scope: str = "diff-node",
+        node: Optional[str] = None,
+        protocol: DiffProtocol = "json",
+    ) -> Tuple[Any, DiffProtocol, str, bool]:
+        """Deduplicate same-key misses through a short-lived Redis lock.
+
+        RedisStore owns cross-process coordination, matching LocalStore's signature.
+        Parent and child locks differ, so their misses may backfill concurrently; the
+        winning NX value is retained and racing duplicate writes become hits.
+        """
+        existing = self._raw_get(key, scope=scope, node=node)
+        if existing is not None:
+            value, found_protocol = existing
+            return value, found_protocol, "hit", False
+
+        lock_key = key.replace(":node:", ":lock:", 1)
+        owner = bool(self._store.set(lock_key, b"1", nx=True, ex=30))
+        if owner:
+            try:
+                current = self._store.get(key)
+                if current is not None:
+                    value, found_protocol = decode_diff_payload(current)
+                    self._trace(
+                        operation="get",
+                        scope=scope,
+                        key=key,
+                        result="hit",
+                        protocol=found_protocol,
+                        node=node,
+                    )
+                    return value, found_protocol, "hit", False
+
+                value = factory()
+                self._raw_set(key, value, protocol=protocol, scope=scope, node=node, nx=True)
+                self._trace(
+                    operation="get",
+                    scope=scope,
+                    key=key,
+                    result="backfill",
+                    protocol=protocol,
+                    node=node,
+                )
+                return value, protocol, "backfill", True
+            finally:
+                self._store.delete(lock_key)
+
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if self._store.get(key) is not None or not self._store.exists(lock_key):
+                break
+            time.sleep(0.01)
+
+        current = self._store.get(key)
+        if current is not None:
+            value, found_protocol = decode_diff_payload(current)
+            self._trace(
+                operation="get",
+                scope=scope,
+                key=key,
+                result="hit",
+                protocol=found_protocol,
+                node=node,
+            )
+            return value, found_protocol, "hit", False
+
+        self._store.delete(lock_key)
+        return self._get_or_set_raw(key, factory, scope=scope, node=node, protocol=protocol)
 
     def get_all_model_names(self) -> Set[str]:
         """Get all the model names stored.
@@ -168,13 +278,17 @@ class RedisStore(BaseStore):
 
         existing_obj_binary = self._store.get(object_key)
         if existing_obj_binary:
+            if not isinstance(existing_obj_binary, (bytes, bytearray)):
+                raise ObjectStoreException(f"Model key {object_key} contains a non-pickle value")
             existing_obj = loads(existing_obj_binary)  # noqa: S301
             existing_obj_dict = existing_obj.dict()
 
             if existing_obj_dict != obj.dict():
+                self._trace(operation="set", scope="model", key=object_key, result="duplicate", protocol="pickle")
                 raise ObjectAlreadyExists(f"Object {uid} already present", obj)
 
             # Return so we don't have to change anything on the existing object and underlying data
+            self._trace(operation="set", scope="model", key=object_key, result="duplicate", protocol="pickle")
             return
 
         # Remove the diffsync object before sending to Redis
@@ -182,6 +296,7 @@ class RedisStore(BaseStore):
         obj_copy.adapter = None
 
         self._store.set(object_key, dumps(obj_copy))
+        self._trace(operation="set", scope="model", key=object_key, result="set", protocol="pickle")
 
     def update(self, *, obj: "DiffSyncModel") -> None:
         """Update a DiffSyncModel object to the store.
@@ -197,15 +312,18 @@ class RedisStore(BaseStore):
         obj_copy.adapter = None
 
         self._store.set(object_key, dumps(obj_copy))
+        self._trace(operation="set", scope="model", key=object_key, result="overwrite", protocol="pickle")
 
     def remove_item(self, modelname: str, uid: str) -> None:
         """Remove one item from store."""
         object_key = self._get_key_for_object(modelname, uid)
 
         if not self._store.exists(object_key):
+            self._trace(operation="delete", scope="model", key=object_key, result="miss")
             raise ObjectNotFound(f"{modelname} {uid} not present in Cache")
 
         self._store.delete(object_key)
+        self._trace(operation="delete", scope="model", key=object_key, result="delete")
 
     def count(self, *, model: Union[str, "DiffSyncModel", Type["DiffSyncModel"], None] = None) -> int:
         """Returns the number of elements of a specific model, or all elements in the store if unspecified."""

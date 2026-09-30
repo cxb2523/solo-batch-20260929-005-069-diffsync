@@ -1,13 +1,86 @@
 """BaseStore module."""
 
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Type, Union
+import json
+import uuid
+from dataclasses import dataclass
+from itertools import count
+from pickle import dumps as pickle_dumps
+from pickle import loads as pickle_loads
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Literal, Optional, Set, Tuple, Type, Union, cast
+from urllib.parse import quote, unquote
 
 import structlog  # type: ignore
 
+from diffsync.diff import Diff
 from diffsync.exceptions import ObjectNotFound
 
 if TYPE_CHECKING:
     from diffsync import Adapter, DiffSyncModel
+    from diffsync.diff import DiffElement
+
+
+DiffProtocol = Literal["json", "pickle"]
+
+
+@dataclass
+class StoreEvent:
+    """One observable storage interaction."""
+
+    sequence: int
+    operation: str
+    scope: str
+    key: str
+    result: str
+    protocol: Optional[str] = None
+    node: Optional[str] = None
+    detail: Optional[str] = None
+
+
+def _diff_protocol_payload(value: Any, protocol: DiffProtocol) -> Dict[str, Any]:
+    """Wrap a diff payload with its serialization protocol."""
+    return {"__diffsync_diff_protocol__": protocol, "data": value}
+
+
+def encode_diff_payload(value: Any, protocol: DiffProtocol = "json") -> Union[str, bytes]:
+    """Encode a diff payload using JSON first or pickle when explicitly requested."""
+    payload = _diff_protocol_payload(value, protocol)
+    if protocol == "json":
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return pickle_dumps(payload)
+
+
+def decode_diff_payload(raw: Union[str, bytes]) -> Tuple[Any, DiffProtocol]:
+    """Decode a diff payload, trying JSON before falling back to pickle.
+
+    JSON is the portable default. Pickle remains a fallback for keys written by an older
+    pickle producer; both paths require the envelope written by these Store APIs.
+    """
+    try:
+        if isinstance(raw, bytes):
+            decoded = json.loads(raw.decode("utf-8"))
+        else:
+            decoded = json.loads(raw)
+        actual_protocol = "json"
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        if not isinstance(raw, (bytes, bytearray)):
+            raise TypeError("pickle payload must be bytes")
+        decoded = pickle_loads(raw)  # noqa: S301
+        actual_protocol = "pickle"
+
+    if isinstance(decoded, dict) and "__diffsync_diff_protocol__" in decoded:
+        actual_protocol = decoded["__diffsync_diff_protocol__"]
+        decoded = decoded["data"]
+    return decoded, cast(DiffProtocol, actual_protocol)
+
+
+def encode_diff_node_id(*parts: Any) -> str:
+    """Build a collision-resistant slash-delimited diff node identifier."""
+    return "/".join(quote(str(part), safe="") for part in parts)
+
+
+def decode_diff_node_id(node_id: str) -> List[str]:
+    """Split a diff node identifier into its quoted path parts."""
+    return [unquote(part) for part in node_id.split("/") if part]
 
 
 class BaseStore:
@@ -23,11 +96,409 @@ class BaseStore:
         """Init method for BaseStore."""
         self.adapter = adapter
         self.name = name or self.__class__.__name__
+        self.store_id = str(uuid.uuid4())
+        self.trace_events: List[StoreEvent] = []
+        self._trace_sequence = count(1)
+        self.last_diff_rebuild_order: List[str] = []
         self._log = structlog.get_logger().new(store=self)
 
     def __str__(self) -> str:
         """Render store name."""
         return self.name
+
+    def trace_clear(self) -> None:
+        """Remove all observed storage events."""
+        self.trace_events = []
+
+    def trace_summary(self) -> Dict[str, object]:
+        """Return trace counters and hit rate."""
+        gets = [event for event in self.trace_events if event.operation == "get"]
+        hits = len([event for event in gets if event.result == "hit"])
+        misses = len([event for event in gets if event.result in ("miss", "backfill")])
+        sets = len([event for event in self.trace_events if event.operation == "set"])
+        backfills = len([event for event in gets if event.result == "backfill"])
+        total = hits + misses
+        return {
+            "gets": total,
+            "hits": hits,
+            "misses": misses,
+            "sets": sets,
+            "backfills": backfills,
+            "hit_rate": (hits / total) if total else 0.0,
+        }
+
+    def _trace(
+        self,
+        *,
+        operation: str,
+        scope: str,
+        key: str,
+        result: str,
+        protocol: Optional[str] = None,
+        node: Optional[str] = None,
+        detail: Optional[str] = None,
+    ) -> None:
+        """Record one storage event for traces and tests."""
+        self.trace_events.append(
+            StoreEvent(
+                sequence=next(self._trace_sequence),
+                operation=operation,
+                scope=scope,
+                key=key,
+                result=result,
+                protocol=protocol,
+                node=node,
+                detail=detail,
+            )
+        )
+
+    def trace_key_events(self, key: str) -> List[StoreEvent]:
+        """Return all observed events for one key in call order."""
+        return [event for event in self.trace_events if event.key == key]
+
+    def _diff_tree_prefix(self, tree: str) -> str:
+        """Get the backend-specific prefix for a diff tree."""
+        return f"diff:{self.store_id}:{quote(tree, safe='')}"
+
+    def _diff_root_key(self, tree: str) -> str:
+        """Get root metadata key outside the scannable child-node prefix."""
+        return f"{self._diff_tree_prefix(tree)}:root"
+
+    def _diff_index_key(self, tree: str) -> str:
+        """Get the child-node index key outside the scannable child-node prefix."""
+        return f"{self._diff_tree_prefix(tree)}:index"
+
+    def _diff_node_key(self, tree: str, node_id: str) -> str:
+        """Get a child-node key under an explicit node segment."""
+        return f"{self._diff_tree_prefix(tree)}:node:{node_id}"
+
+    def _diff_node_prefix(self, tree: str) -> str:
+        """Get the prefix that contains only child nodes."""
+        return f"{self._diff_tree_prefix(tree)}:node:*"
+
+    def _backend_raw_get(self, key: str) -> Optional[Union[str, bytes]]:
+        """Get one encoded value from the concrete backend."""
+        raise NotImplementedError
+
+    def _backend_raw_set(self, key: str, value: Union[str, bytes], *, nx: bool = False) -> bool:
+        """Set one encoded value in the concrete backend."""
+        raise NotImplementedError
+
+    def _backend_raw_delete(self, key: str) -> None:
+        """Delete one encoded value from the concrete backend."""
+        raise NotImplementedError
+
+    def _backend_raw_scan_prefix(self, prefix: str) -> List[str]:
+        """List keys under a concrete backend prefix."""
+        raise NotImplementedError
+
+    def _raw_get(
+        self, key: str, *, scope: str = "diff-node", node: Optional[str] = None
+    ) -> Optional[Tuple[Any, DiffProtocol]]:
+        """Get and decode a diff payload while recording the lookup."""
+        raw = self._backend_raw_get(key)
+        if raw is None:
+            self._trace(operation="get", scope=scope, key=key, result="miss", node=node)
+            return None
+        value, protocol = decode_diff_payload(raw)
+        self._trace(
+            operation="get",
+            scope=scope,
+            key=key,
+            result="hit",
+            protocol=protocol,
+            node=node,
+        )
+        return value, protocol
+
+    def _raw_set(
+        self,
+        key: str,
+        value: Any,
+        *,
+        protocol: DiffProtocol = "json",
+        scope: str = "diff-node",
+        node: Optional[str] = None,
+        nx: bool = False,
+    ) -> bool:
+        """Encode and set a diff payload while recording the write."""
+        created = self._backend_raw_set(key, encode_diff_payload(value, protocol), nx=nx)
+        self._trace(
+            operation="set",
+            scope=scope,
+            key=key,
+            result="set" if created else "duplicate",
+            protocol=protocol,
+            node=node,
+        )
+        return created
+
+    def _get_or_set_raw(
+        self,
+        key: str,
+        factory: Callable[[], Any],
+        *,
+        scope: str = "diff-node",
+        node: Optional[str] = None,
+        protocol: DiffProtocol = "json",
+    ) -> Tuple[Any, DiffProtocol, str, bool]:
+        """Get a payload or call factory once on a miss.
+
+        Concrete backends override this to own same-key request deduplication.
+        Parent and child are distinct keys, so both may miss and backfill together;
+        duplicate writes for one key are not allowed to overwrite the first value.
+        """
+        existing = self._raw_get(key, scope=scope, node=node)
+        if existing is not None:
+            value, found_protocol = existing
+            return value, found_protocol, "hit", False
+
+        value = factory()
+        self._raw_set(key, value, protocol=protocol, scope=scope, node=node)
+        self._trace(operation="get", scope=scope, key=key, result="backfill", protocol=protocol, node=node)
+        return value, protocol, "backfill", True
+
+    @staticmethod
+    def _element_to_payload(element: "DiffElement") -> Dict[str, Any]:
+        """Serialize one DiffElement without embedding its child tree."""
+        return {
+            "kind": "element",
+            "type": element.type,
+            "name": element.name,
+            "keys": element.keys,
+            "source_name": element.source_name,
+            "dest_name": element.dest_name,
+            "source_attrs": element.source_attrs,
+            "dest_attrs": element.dest_attrs,
+            "groups": [
+                {
+                    "type": child_type,
+                    "names": list(element.child_diff.children[child_type].keys()),
+                }
+                for child_type in element.child_diff.groups()
+            ],
+        }
+
+    @staticmethod
+    def _payload_to_element(payload: Dict[str, Any], diff_class: Type["Diff"]) -> "DiffElement":
+        """Recreate one DiffElement from its payload."""
+        from diffsync.diff import DiffElement
+
+        element = DiffElement(
+            payload["type"],
+            payload["name"],
+            payload["keys"],
+            source_name=payload["source_name"],
+            dest_name=payload["dest_name"],
+            diff_class=diff_class,
+        )
+        element.add_attrs(source=payload.get("source_attrs"), dest=payload.get("dest_attrs"))
+        return element
+
+    @staticmethod
+    def _diff_to_payload(diff: "Diff") -> Dict[str, Any]:
+        """Serialize root group order."""
+        return {
+            "kind": "diff",
+            "models_processed": diff.models_processed,
+            "groups": [
+                {"type": group_type, "names": list(diff.children[group_type].keys())}
+                for group_type in diff.groups()
+            ],
+        }
+
+    @staticmethod
+    def _payload_to_diff(payload: Optional[Dict[str, Any]] = None) -> "Diff":
+        """Recreate an empty root Diff."""
+        from diffsync.diff import Diff
+
+        diff = Diff()
+        if payload:
+            diff.models_processed = int(payload.get("models_processed", 0))
+        return diff
+
+    def dump_diff(self, diff: "Diff", *, tree: str = "default", protocol: DiffProtocol = "json") -> None:
+        """Persist child nodes first, root next, and the preorder index last.
+
+        The index makes normal reconstruction O(nodes) direct gets. A root and child
+        prefix cannot safely share a trailing wildcard, so node keys use an explicit
+        `:node:` segment and root/index sit beside it. If the index is later lost,
+        the first reader pays one `:node:*` scan and rewrites the recovered index.
+        """
+        preorder: List[str] = []
+        postorder: List[Tuple[str, Dict[str, Any]]] = []
+
+        def collect(element: "DiffElement", node_id: str) -> None:
+            preorder.append(node_id)
+            payload = self._element_to_payload(element)
+            for group_payload in payload["groups"]:
+                for child_name in group_payload["names"]:
+                    child = element.child_diff.children[group_payload["type"]][child_name]
+                    child_id = f"{node_id}/{encode_diff_node_id(group_payload['type'], child.name)}"
+                    collect(child, child_id)
+            postorder.append((node_id, payload))
+
+        for group in diff.groups():
+            for child in diff.children[group].values():
+                collect(child, encode_diff_node_id(group, child.name))
+
+        for node_id, payload in postorder:
+            self._raw_set(
+                self._diff_node_key(tree, node_id),
+                payload,
+                protocol=protocol,
+                scope="diff-node",
+                node=node_id,
+            )
+
+        self._raw_set(
+            self._diff_root_key(tree),
+            self._diff_to_payload(diff),
+            protocol=protocol,
+            scope="diff-root",
+            node="<root>",
+        )
+        self._raw_set(
+            self._diff_index_key(tree),
+            {"kind": "diff-index", "order": preorder},
+            protocol=protocol,
+            scope="diff-index",
+            node="<index>",
+        )
+
+    def load_diff(self, *, tree: str = "default", diff_class: Optional[Type["Diff"]] = None) -> "Diff":
+        """Rebuild a Diff in the stored preorder, repairing a missing index once."""
+        root_key = self._diff_root_key(tree)
+        index_key = self._diff_index_key(tree)
+
+        root = self._raw_get(root_key, scope="diff-root", node="<root>")
+        if root is None:
+            raise ObjectNotFound(f"Diff root {root_key} not present in {str(self)}")
+        root_payload, _ = root
+
+        index = self._raw_get(index_key, scope="diff-index", node="<index>")
+        if index is None:
+            self._repair_diff_index(tree, root_payload)
+            repaired_index_raw = self._backend_raw_get(index_key)
+            if repaired_index_raw is None:
+                raise ObjectNotFound(f"Diff index {index_key} could not be repaired in {str(self)}")
+            index_payload, _ = decode_diff_payload(repaired_index_raw)
+        else:
+            index_payload, _ = index
+
+        nodes: Dict[str, "DiffElement"] = {}
+        rebuild_order: List[str] = []
+        def build_element(node_id: str) -> "DiffElement":
+            if node_id in nodes:
+                return nodes[node_id]
+            rebuild_order.append(node_id)
+            node = self._raw_get(self._diff_node_key(tree, node_id), scope="diff-node", node=node_id)
+            if node is None:
+                raise ObjectNotFound(f"Diff node {node_id} not present in {str(self)}")
+            payload, _ = node
+            element = self._payload_to_element(payload, diff_class if diff_class is not None else Diff)
+            for group_payload in payload.get("groups", []):
+                for name in group_payload["names"]:
+                    child_id = f"{node_id}/{encode_diff_node_id(group_payload['type'], name)}"
+                    element.add_child(build_element(child_id))
+            nodes[node_id] = element
+            return element
+
+        root_class = diff_class if diff_class is not None else Diff
+        diff = root_class()
+        diff.models_processed = int(root_payload.get("models_processed", 0))
+        for group_payload in root_payload.get("groups", []):
+            for name in group_payload["names"]:
+                node_id = encode_diff_node_id(group_payload["type"], name)
+                diff.add(build_element(node_id))
+
+        self.last_diff_rebuild_order = rebuild_order
+        return diff
+
+    def _repair_diff_index(self, tree: str, root_payload: Dict[str, Any]) -> None:
+        """Rebuild and rewrite the index with one bounded node-prefix scan.
+
+        The first reader after index loss accepts the scan cost once. Existing
+        payloads are still read individually, because scan only identifies keys and
+        must not silently bypass hit/miss observability or protocol fallback.
+        """
+        expected: Set[str] = set()
+
+        def discover(node_id: str, order: List[str]) -> None:
+            expected.add(node_id)
+            order.append(node_id)
+            node = self._raw_get(self._diff_node_key(tree, node_id), scope="diff-node", node=node_id)
+            if node is None:
+                return
+            payload, _ = node
+            for group_payload in payload.get("groups", []):
+                for name in group_payload["names"]:
+                    discover(f"{node_id}/{encode_diff_node_id(group_payload['type'], name)}", order)
+
+        ordered_nodes: List[str] = []
+        for group_payload in root_payload.get("groups", []):
+            for name in group_payload["names"]:
+                discover(encode_diff_node_id(group_payload["type"], name), ordered_nodes)
+
+        scanned = set(self._backend_raw_scan_prefix(self._diff_node_prefix(tree)))
+        orphaned = sorted(scanned - {self._diff_node_key(tree, node_id) for node_id in expected})
+        self._trace(
+            operation="scan",
+            scope="diff-repair",
+            key=self._diff_node_prefix(tree),
+            result="index-repaired",
+            detail=f"orphaned={len(orphaned)}",
+        )
+        self._raw_set(
+            self._diff_index_key(tree),
+            {"kind": "diff-index", "order": ordered_nodes},
+            scope="diff-index",
+            node="<index>",
+        )
+
+    def get_or_set_diff_node(
+        self,
+        *,
+        tree: str,
+        node_id: str,
+        factory: Callable[[], "DiffElement"],
+        protocol: DiffProtocol = "json",
+    ) -> Tuple["DiffElement", DiffProtocol, str, bool]:
+        """Get one DiffElement or call the node-specific source factory on a miss.
+
+        Same-node concurrent requests are collapsed by LocalStore in-process and by
+        RedisStore's backend lock. A parent miss and child miss remain independent
+        source calls; their first written values are preserved without overwrite.
+        """
+        def payload_factory() -> Dict[str, Any]:
+            return self._element_to_payload(factory())
+
+        payload, found_protocol, result, backfilled = self._get_or_set_raw(
+            self._diff_node_key(tree, node_id),
+            payload_factory,
+            scope="diff-node",
+            node=node_id,
+            protocol=protocol,
+        )
+        return self._payload_to_element(payload, Diff), found_protocol, result, backfilled
+
+    def set_diff_node(
+        self, *, tree: str, node_id: str, element: "DiffElement", protocol: DiffProtocol = "json"
+    ) -> None:
+        """Explicitly write one DiffElement node, overwriting intentional updates."""
+        self._raw_set(
+            self._diff_node_key(tree, node_id),
+            self._element_to_payload(element),
+            protocol=protocol,
+            scope="diff-node",
+            node=node_id,
+        )
+
+    def remove_diff_node(self, *, tree: str, node_id: str) -> None:
+        """Remove one DiffElement node."""
+        key = self._diff_node_key(tree, node_id)
+        self._backend_raw_delete(key)
+        self._trace(operation="delete", scope="diff-node", key=key, result="delete", node=node_id)
 
     def get_all_model_names(self) -> Set[str]:
         """Get all the model names stored.
@@ -270,3 +741,8 @@ class BaseStore:
                 f"either {object_class} should be a class/instance or {identifier} should be a str"
             )
         return uid
+
+
+# Compatibility alias for callers/docs referring to the unified Store API.
+Store = BaseStore
+
